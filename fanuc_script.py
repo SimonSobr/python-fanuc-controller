@@ -20,8 +20,8 @@ ROBOT_CONFIG_PATH = os.path.join(BASE_DIR, "robot_positions.json")
 # ============================================================
 # CONFIG
 # ============================================================
-SIM_MODE = True
-CAM_INDEX = 0
+SIM_MODE = False
+CAM_INDEX = 2
 MIRROR_DISPLAY = True
 
 WINDOW_WIDTH = 1280

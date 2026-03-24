@@ -9,8 +9,8 @@
     "use_gripper": true
   },
   "motion": {
-    "joint_velocity": 20,
-    "joint_acceleration": 20,
+    "joint_velocity": 50,
+    "joint_acceleration": 50,
     "cnt_val": 0,
     "linear": false,
     "sleep_after_move_s": 0.0,
