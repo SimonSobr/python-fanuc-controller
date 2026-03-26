@@ -21,7 +21,7 @@ ROBOT_CONFIG_PATH = os.path.join(BASE_DIR, "robot_positions.json")
 # CONFIG
 # ============================================================
 SIM_MODE = False
-CAM_INDEX = 2
+CAM_INDEX = 0
 MIRROR_DISPLAY = True
 
 WINDOW_WIDTH = 1280
@@ -649,7 +649,7 @@ def canonical_count_from_states(states):
 
 
 def is_confirm_gesture(states):
-    return states == (True, False, False, False, True)
+    return states == (False, False, True, True, True)
 
 
 def is_undo_gesture(states):
@@ -657,7 +657,7 @@ def is_undo_gesture(states):
 
 
 def is_new_batch_gesture(states):
-    return states == (False, False, True, True, True)
+    return states == (True, False, False, False, True)
 
 
 def detect_swipe(center_now, center_ref):
