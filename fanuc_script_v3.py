@@ -8,13 +8,7 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-
-try:
-    from fanucpy import Robot
-    FANUCPY_AVAILABLE = True
-except ImportError:
-    Robot = None
-    FANUCPY_AVAILABLE = False
+from fanucpy import Robot
 
 # ============================================================
 # PATHS
@@ -26,14 +20,15 @@ ROBOT_CONFIG_PATH = os.path.join(BASE_DIR, "robot_positions.json")
 # ============================================================
 # CONFIG
 # ============================================================
-SIM_MODE = True
-CAM_INDEX = 0
+SIM_MODE = False
+CAM_INDEX = 1
 MIRROR_DISPLAY = True
 
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 
 TOTAL_PARTS = 5
+TARGET_CATEGORIES = ("OK", "REDO1", "REDO2", "NOK")
 
 COUNT_HOLD_S = 0.7
 SWIPE_WINDOW_S = 1.5
@@ -48,15 +43,26 @@ SWIPE_X_THR = 0.15
 SWIPE_Y_THR = 0.15
 DIRECTION_DOMINANCE = 1.15
 
-MIN_HAND_DET_CONF = 0.5
-MIN_HAND_PRESENCE_CONF = 0.5
-MIN_TRACKING_CONF = 0.5
+MIN_HAND_DET_CONF = 0.8
+MIN_HAND_PRESENCE_CONF = 0.8
+MIN_TRACKING_CONF = 0.8
 
 CATEGORY_FROM_DIRECTION = {
     "RIGHT": "OK",
-    "UP": "REDO",
+    "UP": "REDO1",
+    "DOWN": "REDO2",
     "LEFT": "NOK",
 }
+
+MODE_CLASSIC = "CLASSIC"
+MODE_GESTURE = "GESTURE"
+
+KEY_ARROW_LEFT = 2424832
+KEY_ARROW_UP = 2490368
+KEY_ARROW_RIGHT = 2555904
+KEY_ARROW_DOWN = 2621440
+KEY_ENTER = {10, 13}
+KEY_DIGITS = {ord(str(i)): i for i in range(1, TOTAL_PARTS + 1)}
 
 # ============================================================
 # DEFAULT ROBOT CONFIG TEMPLATE
@@ -70,14 +76,18 @@ DEFAULT_ROBOT_CONFIG = {
         "ee_DO_type": "RDO",
         "ee_DO_num": 7,
         "use_gripper": True,
+        "gripper_toggle_program": "GRIPPER",
+        "initial_gripper_open": True,
     },
     "motion": {
-        "joint_velocity": 20,
-        "joint_acceleration": 20,
+        "transfer_joint_velocity": 20,
+        "transfer_joint_acceleration": 20,
+        "process_joint_velocity": 20,
+        "process_joint_acceleration": 20,
         "cnt_val": 0,
         "linear": False,
         "sleep_after_move_s": 0.0,
-        "sleep_after_gripper_s": 0.2,
+        "sleep_after_gripper_s": 1.0,
         "home_before_start": True,
         "home_after_finish": True,
         "open_gripper_before_pick": True,
@@ -99,7 +109,14 @@ DEFAULT_ROBOT_CONFIG = {
                 "4": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
                 "5": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
             },
-            "REDO": {
+            "REDO1": {
+                "1": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
+                "2": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
+                "3": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
+                "4": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
+                "5": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
+            },
+            "REDO2": {
                 "1": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
                 "2": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
                 "3": {"approach": [0, 0, 0, 0, 0, 0], "place": [0, 0, 0, 0, 0, 0]},
@@ -242,7 +259,7 @@ def validate_robot_config_structure(cfg) -> None:
         validate_joint_list(src.get("approach"), f"poses.sources.{i}.approach")
         validate_joint_list(src.get("pick"), f"poses.sources.{i}.pick")
 
-    for category in ("OK", "REDO", "NOK"):
+    for category in TARGET_CATEGORIES:
         cat = poses["targets"].get(category)
         if cat is None:
             raise ValueError(f"Missing target category {category} in robot config")
@@ -258,9 +275,24 @@ def format_joints(vals):
     return "[" + ", ".join(f"{float(v):.3f}" for v in vals) + "]"
 
 
+def get_motion_profile(robot_cfg, profile_name: str):
+    motion = robot_cfg["motion"]
+    if profile_name == "transfer":
+        return {
+            "velocity": motion["transfer_joint_velocity"],
+            "acceleration": motion["transfer_joint_acceleration"],
+        }
+    if profile_name == "process":
+        return {
+            "velocity": motion["process_joint_velocity"],
+            "acceleration": motion["process_joint_acceleration"],
+        }
+    raise ValueError(f"Unknown motion profile: {profile_name}")
+
+
 def build_execution_plan(assignments, robot_cfg):
     poses = robot_cfg["poses"]
-    target_fill_count = {"OK": 0, "REDO": 0, "NOK": 0}
+    target_fill_count = {category: 0 for category in TARGET_CATEGORIES}
     plan = []
 
     for source_slot, category in enumerate(assignments, start=1):
@@ -301,26 +333,44 @@ def print_execution_plan(plan) -> None:
 def simulate_robot_execution(plan, robot_cfg) -> None:
     motion = robot_cfg["motion"]
     home = robot_cfg["poses"]["home"]
-    use_gripper = bool(robot_cfg["robot_connection"].get("use_gripper", True))
-    gripper_is_open = None
+    conn = robot_cfg["robot_connection"]
+    use_gripper = bool(conn.get("use_gripper", True))
+    toggle_program = conn.get("gripper_toggle_program", "GRIPPER")
+    toggle_sleep_s = float(motion.get("sleep_after_gripper_s", 1.0))
+    gripper_is_open = conn.get("initial_gripper_open", True)
 
     def maybe_set_gripper(is_open: bool):
         nonlocal gripper_is_open
         if not use_gripper:
             return
-        if gripper_is_open is not None and gripper_is_open == is_open:
+        if gripper_is_open == is_open:
             return
-        print("GRIPPER OPEN" if is_open else "GRIPPER CLOSE")
-        gripper_is_open = is_open
+
+        print(f"CALL PROG {toggle_program}  # toggle gripper")
+        gripper_is_open = not gripper_is_open
+        print("GRIPPER OPEN" if gripper_is_open else "GRIPPER CLOSE")
+
+        if toggle_sleep_s > 0:
+            print(f"SLEEP {toggle_sleep_s:.1f}s")
+
+    transfer_profile = get_motion_profile(robot_cfg, "transfer")
+    process_profile = get_motion_profile(robot_cfg, "process")
 
     print_execution_plan(plan)
     print("SIMULATION OF ROBOT COMMANDS")
-    print(f"Joint velocity: {motion['joint_velocity']}")
-    print(f"Joint acceleration: {motion['joint_acceleration']}")
+    print(
+        f"Transfer profile: vel={transfer_profile['velocity']}, "
+        f"acc={transfer_profile['acceleration']}"
+    )
+    print(
+        f"Process profile: vel={process_profile['velocity']}, "
+        f"acc={process_profile['acceleration']}"
+    )
     print(f"CNT value: {motion['cnt_val']}")
+    print(f"Initial gripper state: {'OPEN' if gripper_is_open else 'CLOSED'}")
 
     if motion.get("home_before_start", True):
-        print(f"MOVE HOME -> {format_joints(home)}")
+        print(f"MOVE [transfer] HOME -> {format_joints(home)}")
 
     for step_idx, step in enumerate(plan, start=1):
         print("-" * 78)
@@ -329,17 +379,35 @@ def simulate_robot_execution(plan, robot_cfg) -> None:
         if motion.get("open_gripper_before_pick", True):
             maybe_set_gripper(True)
 
-        print(f"MOVE source[{step['source_slot']}].approach -> {format_joints(step['source_approach'])}")
-        print(f"MOVE source[{step['source_slot']}].pick     -> {format_joints(step['source_pick'])}")
+        print(
+            f"MOVE [transfer] source[{step['source_slot']}].approach -> "
+            f"{format_joints(step['source_approach'])}"
+        )
+        print(
+            f"MOVE [process] source[{step['source_slot']}].pick     -> "
+            f"{format_joints(step['source_pick'])}"
+        )
         maybe_set_gripper(False)
-        print(f"MOVE source[{step['source_slot']}].approach -> {format_joints(step['source_approach'])}")
-        print(f"MOVE {step['category']}[{step['target_slot']}].approach -> {format_joints(step['target_approach'])}")
-        print(f"MOVE {step['category']}[{step['target_slot']}].place    -> {format_joints(step['target_place'])}")
+        print(
+            f"MOVE [process] source[{step['source_slot']}].approach -> "
+            f"{format_joints(step['source_approach'])}"
+        )
+        print(
+            f"MOVE [transfer] {step['category']}[{step['target_slot']}].approach -> "
+            f"{format_joints(step['target_approach'])}"
+        )
+        print(
+            f"MOVE [process] {step['category']}[{step['target_slot']}].place    -> "
+            f"{format_joints(step['target_place'])}"
+        )
         maybe_set_gripper(True)
-        print(f"MOVE {step['category']}[{step['target_slot']}].approach -> {format_joints(step['target_approach'])}")
+        print(
+            f"MOVE [process] {step['category']}[{step['target_slot']}].approach -> "
+            f"{format_joints(step['target_approach'])}"
+        )
 
     if motion.get("home_after_finish", True):
-        print(f"MOVE HOME -> {format_joints(home)}")
+        print(f"MOVE [transfer] HOME -> {format_joints(home)}")
 
     print("=" * 78)
     print("SIMULATION FINISHED")
@@ -351,17 +419,17 @@ class FanucRobotController:
         self.robot_cfg = robot_cfg
         self.robot = None
         self.connected = False
-        self.gripper_is_open = None
+        self.gripper_is_open = self._get_initial_gripper_state()
+
+    def _get_initial_gripper_state(self) -> bool:
+        return bool(self.robot_cfg["robot_connection"].get("initial_gripper_open", True))
+
+    def _get_gripper_toggle_program(self) -> str:
+        return str(self.robot_cfg["robot_connection"].get("gripper_toggle_program", "GRIPPER"))
 
     def ensure_connected(self):
         if self.connected:
             return
-
-        if not FANUCPY_AVAILABLE:
-            raise RuntimeError(
-                "fanucpy is not installed. Install it with 'pip install fanucpy' "
-                "before running with SIM_MODE = False."
-            )
 
         if not self.robot_cfg.get("configured", False):
             raise RuntimeError(
@@ -384,8 +452,9 @@ class FanucRobotController:
         self.robot = Robot(**kwargs)
         self.robot.connect()
         self.connected = True
-        self.gripper_is_open = None
+        self.gripper_is_open = self._get_initial_gripper_state()
         print(f"Connected to FANUC robot at {conn['host']}:{conn['port']}")
+        print(f"Initial gripper state: {'OPEN' if self.gripper_is_open else 'CLOSED'}")
 
     def maybe_disconnect(self):
         if self.robot is not None and hasattr(self.robot, "disconnect"):
@@ -395,16 +464,20 @@ class FanucRobotController:
                 pass
         self.connected = False
         self.robot = None
-        self.gripper_is_open = None
+        self.gripper_is_open = self._get_initial_gripper_state()
 
-    def move_joint(self, vals, label: str):
+    def move_joint(self, vals, label: str, profile_name: str):
         motion = self.robot_cfg["motion"]
-        print(f"MOVE {label} -> {format_joints(vals)}")
+        profile = get_motion_profile(self.robot_cfg, profile_name)
+        print(
+            f"MOVE [{profile_name}] {label} -> {format_joints(vals)} "
+            f"(vel={profile['velocity']}, acc={profile['acceleration']})"
+        )
         self.robot.move(
             "joint",
             vals=vals,
-            velocity=motion["joint_velocity"],
-            acceleration=motion["joint_acceleration"],
+            velocity=profile["velocity"],
+            acceleration=profile["acceleration"],
             cnt_val=motion["cnt_val"],
             linear=motion["linear"],
         )
@@ -412,21 +485,27 @@ class FanucRobotController:
         if delay > 0:
             time.sleep(delay)
 
+    def _toggle_gripper(self):
+        program_name = self._get_gripper_toggle_program()
+        print(f"CALL PROG {program_name}  # toggle gripper")
+        self.robot.call_prog(program_name)
+        time.sleep(1.0)
+        self.gripper_is_open = not self.gripper_is_open
+
     def set_gripper(self, is_open: bool):
         use_gripper = bool(self.robot_cfg["robot_connection"].get("use_gripper", True))
         if not use_gripper:
             return
 
-        if self.gripper_is_open is not None and self.gripper_is_open == is_open:
+        if self.gripper_is_open == is_open:
             return
 
-        print("GRIPPER OPEN" if is_open else "GRIPPER CLOSE")
-        self.robot.gripper(is_open)
-        self.gripper_is_open = is_open
+        self._toggle_gripper()
+        print("GRIPPER OPEN" if self.gripper_is_open else "GRIPPER CLOSE")
 
-        delay = float(self.robot_cfg["motion"].get("sleep_after_gripper_s", 0.2))
-        if delay > 0:
-            time.sleep(delay)
+        extra_delay = float(self.robot_cfg["motion"].get("sleep_after_gripper_s", 1.0)) - 1.0
+        if extra_delay > 0:
+            time.sleep(extra_delay)
 
     def get_current_joints(self):
         self.ensure_connected()
@@ -440,7 +519,7 @@ class FanucRobotController:
         print_execution_plan(plan)
 
         if motion.get("home_before_start", True):
-            self.move_joint(home, "HOME")
+            self.move_joint(home, "HOME", "transfer")
 
         for step_idx, step in enumerate(plan, start=1):
             print("-" * 78)
@@ -449,18 +528,18 @@ class FanucRobotController:
             if motion.get("open_gripper_before_pick", True):
                 self.set_gripper(True)
 
-            self.move_joint(step["source_approach"], f"source[{step['source_slot']}].approach")
-            self.move_joint(step["source_pick"], f"source[{step['source_slot']}].pick")
+            self.move_joint(step["source_approach"], f"source[{step['source_slot']}].approach", "transfer")
+            self.move_joint(step["source_pick"], f"source[{step['source_slot']}].pick", "process")
             self.set_gripper(False)
-            self.move_joint(step["source_approach"], f"source[{step['source_slot']}].approach")
+            self.move_joint(step["source_approach"], f"source[{step['source_slot']}].approach", "process")
 
-            self.move_joint(step["target_approach"], f"{step['category']}[{step['target_slot']}].approach")
-            self.move_joint(step["target_place"], f"{step['category']}[{step['target_slot']}].place")
+            self.move_joint(step["target_approach"], f"{step['category']}[{step['target_slot']}].approach", "transfer")
+            self.move_joint(step["target_place"], f"{step['category']}[{step['target_slot']}].place", "process")
             self.set_gripper(True)
-            self.move_joint(step["target_approach"], f"{step['category']}[{step['target_slot']}].approach")
+            self.move_joint(step["target_approach"], f"{step['category']}[{step['target_slot']}].approach", "process")
 
         if motion.get("home_after_finish", True):
-            self.move_joint(home, "HOME")
+            self.move_joint(home, "HOME", "transfer")
 
 # ============================================================
 # DRAWING
@@ -518,6 +597,81 @@ def put_lines_right(frame: np.ndarray, lines, right_margin: int = 20, y0: int = 
             thickness,
             cv2.LINE_AA,
         )
+
+
+def create_blank_frame() -> np.ndarray:
+    return np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 3), dtype=np.uint8)
+
+
+def draw_mode_select_screen(frame: np.ndarray, robot_cfg) -> None:
+    lines = [
+        "Choose control mode:",
+        "K = classic mode (keyboard only, no camera)",
+        "G = gesture mode (camera + hand gestures)",
+        f"Robot mode: {'SIMULATION' if SIM_MODE else 'REAL ROBOT'}",
+        f"Config JSON: {os.path.basename(ROBOT_CONFIG_PATH)} | configured={robot_cfg.get('configured', False)}",
+        "ESC = exit",
+    ]
+    put_lines(frame, lines, x=40, y0=80, dy=40)
+
+
+def choose_input_mode(robot_cfg):
+    window_name = "Select Control Mode"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, WINDOW_WIDTH, WINDOW_HEIGHT)
+
+    while True:
+        frame = create_blank_frame()
+        draw_mode_select_screen(frame, robot_cfg)
+        cv2.imshow(window_name, frame)
+
+        key = cv2.waitKeyEx(1)
+        if key == 27:
+            cv2.destroyWindow(window_name)
+            return None
+        if key in (ord('k'), ord('K')):
+            cv2.destroyWindow(window_name)
+            return MODE_CLASSIC
+        if key in (ord('g'), ord('G')):
+            cv2.destroyWindow(window_name)
+            return MODE_GESTURE
+
+
+def apply_category_decision(rt, count: int, category: str, now: float) -> None:
+    rt["next_idx"] = apply_decision(
+        rt["assignments"],
+        rt["history"],
+        rt["next_idx"],
+        count,
+        category,
+    )
+
+    print("ASSIGNMENTS:", assignments_to_string(rt["assignments"]))
+
+    if all_parts_assigned(rt["assignments"]):
+        rt["state"] = "WAIT_CONFIRM"
+        clear_transient_runtime(rt)
+        set_ui_message(rt, "All 5 assigned. Press Enter / C or hold CONFIRM gesture.", 4.0)
+    else:
+        rt["state"] = "COOLDOWN"
+        rt["cooldown_until"] = now + COOLDOWN_S
+        clear_transient_runtime(rt)
+
+
+def execute_current_batch(rt, robot_cfg, robot_controller) -> None:
+    plan = build_execution_plan(rt["assignments"], robot_cfg)
+    rt["state"] = "EXECUTING"
+    set_ui_message(rt, "Executing batch...")
+
+    if SIM_MODE:
+        simulate_robot_execution(plan, robot_cfg)
+    else:
+        robot_controller.execute_plan(plan)
+
+    rt["batch_executed"] = True
+    rt["state"] = "DONE"
+    set_ui_message(rt, "Batch executed successfully.", 4.0)
+
 
 # ============================================================
 # HAND / GESTURE LOGIC
@@ -617,8 +771,8 @@ def detect_swipe(center_now, center_ref):
     if abs(dx) >= SWIPE_X_THR and abs(dx) > abs(dy) * DIRECTION_DOMINANCE:
         return "RIGHT" if dx > 0 else "LEFT"
 
-    if -dy >= SWIPE_Y_THR and abs(dy) > abs(dx) * DIRECTION_DOMINANCE:
-        return "UP"
+    if abs(dy) >= SWIPE_Y_THR and abs(dy) > abs(dx) * DIRECTION_DOMINANCE:
+        return "UP" if dy < 0 else "DOWN"
 
     return None
 
@@ -711,36 +865,51 @@ def main():
     robot_cfg = load_robot_config(ROBOT_CONFIG_PATH)
     robot_controller = FanucRobotController(robot_cfg)
 
-    cap = open_camera(CAM_INDEX)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {CAM_INDEX}")
+    selected_mode = choose_input_mode(robot_cfg)
+    if selected_mode is None:
+        return
 
-    print("Loading MediaPipe Hand Landmarker...")
-    landmarker = create_landmarker(MODEL_PATH)
-    print("Hand Landmarker loaded.")
+    cap = None
+    landmarker = None
+
+    if selected_mode == MODE_GESTURE:
+        cap = open_camera(CAM_INDEX)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open camera index {CAM_INDEX}")
+
+        print("Loading MediaPipe Hand Landmarker...")
+        landmarker = create_landmarker(MODEL_PATH)
+        print("Hand Landmarker loaded.")
+    else:
+        print("Classic mode selected: keyboard only, camera disabled.")
+
     print(f"Robot config loaded from: {ROBOT_CONFIG_PATH}")
     print(f"SIM_MODE = {SIM_MODE}")
+    print(f"INPUT MODE = {selected_mode}")
 
     rt = reset_runtime()
-    window_name = "Finger Count + Direction Sorting + Confirm Execute"
+    window_name = "Finger Count + Direction Sorting (OK / REDO1 / REDO2 / NOK)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, WINDOW_WIDTH, WINDOW_HEIGHT)
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("Camera read failed.")
-                break
+            if selected_mode == MODE_GESTURE:
+                ok, frame = cap.read()
+                if not ok:
+                    print("Camera read failed.")
+                    break
 
-            if MIRROR_DISPLAY:
-                frame = cv2.flip(frame, 1)
+                if MIRROR_DISPLAY:
+                    frame = cv2.flip(frame, 1)
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int(time.time() * 1000)
-
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int(time.time() * 1000)
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            else:
+                frame = create_blank_frame()
+                result = None
 
             detected_hand = False
             current_count = None
@@ -750,7 +919,7 @@ def main():
             landmarks = None
             states = None
 
-            if result.hand_landmarks:
+            if result is not None and result.hand_landmarks:
                 landmarks = result.hand_landmarks[0]
                 detected_hand = True
                 current_center = palm_center(landmarks)
@@ -777,201 +946,166 @@ def main():
                 rt["state"] = "WAIT_CONFIRM" if all_parts_assigned(rt["assignments"]) else "WAIT_COUNT"
                 clear_transient_runtime(rt)
 
-            # ------------------------------------------------
-            # NEW BATCH GESTURE (ONLY AFTER DONE)
-            # ------------------------------------------------
-            if rt["state"] == "DONE" and detected_hand and states is not None:
-                if is_new_batch_gesture(states):
-                    if rt["stable_new_batch_started"] is None:
-                        rt["stable_new_batch_started"] = now
-                    elif now - rt["stable_new_batch_started"] >= NEW_BATCH_HOLD_S:
-                        rt = reset_runtime()
-                        set_ui_message(rt, "New batch started.")
-                        print("New batch started by gesture.")
-                        continue
-                else:
-                    rt["stable_new_batch_started"] = None
-            else:
-                if rt["state"] != "DONE":
-                    rt["stable_new_batch_started"] = None
-
-            # ------------------------------------------------
-            # GLOBAL CONFIRM / UNDO GESTURES
-            # ------------------------------------------------
-            if rt["state"] not in ("COOLDOWN", "EXECUTING", "DONE") and detected_hand and states is not None:
-                if is_confirm_gesture(states):
-                    rt["stable_undo_started"] = None
-
-                    if rt["state"] == "WAIT_CONFIRM":
-                        if rt["stable_confirm_started"] is None:
-                            rt["stable_confirm_started"] = now
-                        elif now - rt["stable_confirm_started"] >= CONFIRM_HOLD_S:
-                            try:
-                                plan = build_execution_plan(rt["assignments"], robot_cfg)
-                                rt["state"] = "EXECUTING"
-                                set_ui_message(rt, "Executing batch...")
-
-                                if SIM_MODE:
-                                    simulate_robot_execution(plan, robot_cfg)
-                                else:
-                                    robot_controller.execute_plan(plan)
-
-                                rt["batch_executed"] = True
-                                rt["state"] = "DONE"
-                                set_ui_message(rt, "Batch executed successfully.", 4.0)
-                            except Exception as e:
-                                rt["state"] = "WAIT_CONFIRM"
-                                set_ui_message(rt, f"Execution failed: {e}", 4.0)
-                                print(f"Execution failed: {e}")
-                            finally:
-                                clear_transient_runtime(rt)
+            if selected_mode == MODE_GESTURE:
+                if rt["state"] == "DONE" and detected_hand and states is not None:
+                    if is_new_batch_gesture(states):
+                        if rt["stable_new_batch_started"] is None:
+                            rt["stable_new_batch_started"] = now
+                        elif now - rt["stable_new_batch_started"] >= NEW_BATCH_HOLD_S:
+                            rt = reset_runtime()
+                            set_ui_message(rt, "New batch started.")
+                            print("New batch started by gesture.")
                             continue
                     else:
-                        rt["stable_confirm_started"] = None
-                        if not all_parts_assigned(rt["assignments"]):
-                            set_ui_message(rt, f"Confirm blocked: {rt['next_idx']}/{TOTAL_PARTS} assigned")
-
-                elif is_undo_gesture(states):
-                    rt["stable_confirm_started"] = None
-
-                    if rt["stable_undo_started"] is None:
-                        rt["stable_undo_started"] = now
-                    elif now - rt["stable_undo_started"] >= UNDO_HOLD_S:
-                        if rt["history"]:
-                            rt["next_idx"] = undo_last_step(rt["assignments"], rt["history"])
-                            rt["state"] = "COOLDOWN"
-                            rt["cooldown_until"] = now + COOLDOWN_S
-                            clear_transient_runtime(rt)
-                            rt["batch_executed"] = False
-                            set_ui_message(rt, "Last step removed.")
-                            print("Undo last step by gesture.")
-                            print("ASSIGNMENTS:", assignments_to_string(rt["assignments"]))
-                        else:
-                            set_ui_message(rt, "Nothing to undo.")
-                            rt["stable_undo_started"] = None
-                        continue
-
+                        rt["stable_new_batch_started"] = None
                 else:
-                    rt["stable_confirm_started"] = None
-                    rt["stable_undo_started"] = None
-            else:
-                if rt["state"] not in ("COOLDOWN", "EXECUTING", "DONE"):
-                    rt["stable_confirm_started"] = None
-                    rt["stable_undo_started"] = None
+                    if rt["state"] != "DONE":
+                        rt["stable_new_batch_started"] = None
 
-            # ------------------------------------------------
-            # WAIT_COUNT
-            # ------------------------------------------------
-            if rt["state"] == "WAIT_COUNT":
-                if detected_hand and current_count is not None:
-                    remaining = TOTAL_PARTS - rt["next_idx"]
+                if rt["state"] not in ("COOLDOWN", "EXECUTING", "DONE") and detected_hand and states is not None:
+                    if is_confirm_gesture(states):
+                        rt["stable_undo_started"] = None
 
-                    if 1 <= current_count <= remaining:
-                        if rt["stable_count_value"] != current_count:
-                            rt["stable_count_value"] = current_count
-                            rt["stable_count_started"] = now
-                            rt["stable_center_ref"] = current_center
+                        if rt["state"] == "WAIT_CONFIRM":
+                            if rt["stable_confirm_started"] is None:
+                                rt["stable_confirm_started"] = now
+                            elif now - rt["stable_confirm_started"] >= CONFIRM_HOLD_S:
+                                try:
+                                    execute_current_batch(rt, robot_cfg, robot_controller)
+                                except Exception as e:
+                                    rt["state"] = "WAIT_CONFIRM"
+                                    set_ui_message(rt, f"Execution failed: {e}", 4.0)
+                                    print(f"Execution failed: {e}")
+                                finally:
+                                    clear_transient_runtime(rt)
+                                continue
                         else:
-                            if not hand_is_stable(
-                                current_center,
-                                rt["stable_center_ref"],
-                                COUNT_STABILITY_CENTER_THR,
-                            ):
+                            rt["stable_confirm_started"] = None
+                            if not all_parts_assigned(rt["assignments"]):
+                                set_ui_message(rt, f"Confirm blocked: {rt['next_idx']}/{TOTAL_PARTS} assigned")
+
+                    elif is_undo_gesture(states):
+                        rt["stable_confirm_started"] = None
+
+                        if rt["stable_undo_started"] is None:
+                            rt["stable_undo_started"] = now
+                        elif now - rt["stable_undo_started"] >= UNDO_HOLD_S:
+                            if rt["history"]:
+                                rt["next_idx"] = undo_last_step(rt["assignments"], rt["history"])
+                                rt["state"] = "COOLDOWN"
+                                rt["cooldown_until"] = now + COOLDOWN_S
+                                clear_transient_runtime(rt)
+                                rt["batch_executed"] = False
+                                set_ui_message(rt, "Last step removed.")
+                                print("Undo last step by gesture.")
+                                print("ASSIGNMENTS:", assignments_to_string(rt["assignments"]))
+                            else:
+                                set_ui_message(rt, "Nothing to undo.")
+                                rt["stable_undo_started"] = None
+                            continue
+
+                    else:
+                        rt["stable_confirm_started"] = None
+                        rt["stable_undo_started"] = None
+                else:
+                    if rt["state"] not in ("COOLDOWN", "EXECUTING", "DONE"):
+                        rt["stable_confirm_started"] = None
+                        rt["stable_undo_started"] = None
+
+            if rt["state"] == "WAIT_COUNT":
+                if selected_mode == MODE_GESTURE:
+                    if detected_hand and current_count is not None:
+                        remaining = TOTAL_PARTS - rt["next_idx"]
+
+                        if 1 <= current_count <= remaining:
+                            if rt["stable_count_value"] != current_count:
+                                rt["stable_count_value"] = current_count
                                 rt["stable_count_started"] = now
                                 rt["stable_center_ref"] = current_center
-                            elif now - rt["stable_count_started"] >= COUNT_HOLD_S:
-                                rt["locked_count"] = current_count
-                                rt["swipe_start_center"] = current_center
-                                rt["swipe_started_at"] = now
-                                rt["state"] = "WAIT_DIRECTION"
-                                print(f"LOCKED COUNT = {rt['locked_count']}")
+                            else:
+                                if not hand_is_stable(
+                                    current_center,
+                                    rt["stable_center_ref"],
+                                    COUNT_STABILITY_CENTER_THR,
+                                ):
+                                    rt["stable_count_started"] = now
+                                    rt["stable_center_ref"] = current_center
+                                elif now - rt["stable_count_started"] >= COUNT_HOLD_S:
+                                    rt["locked_count"] = current_count
+                                    rt["swipe_start_center"] = current_center
+                                    rt["swipe_started_at"] = now
+                                    rt["state"] = "WAIT_DIRECTION"
+                                    print(f"LOCKED COUNT = {rt['locked_count']}")
+                        else:
+                            rt["stable_count_value"] = None
+                            rt["stable_count_started"] = None
+                            rt["stable_center_ref"] = None
                     else:
                         rt["stable_count_value"] = None
                         rt["stable_count_started"] = None
                         rt["stable_center_ref"] = None
-                else:
-                    rt["stable_count_value"] = None
-                    rt["stable_count_started"] = None
-                    rt["stable_center_ref"] = None
 
-            # ------------------------------------------------
-            # WAIT_DIRECTION
-            # ------------------------------------------------
             elif rt["state"] == "WAIT_DIRECTION":
-                if not detected_hand or current_center is None:
-                    rt["state"] = "WAIT_COUNT"
-                    rt["locked_count"] = None
-                    rt["swipe_start_center"] = None
-                    rt["swipe_started_at"] = None
-                else:
-                    if now - rt["swipe_started_at"] > SWIPE_WINDOW_S:
-                        print("Swipe timeout -> back to WAIT_COUNT")
+                if selected_mode == MODE_GESTURE:
+                    if not detected_hand or current_center is None:
                         rt["state"] = "WAIT_COUNT"
-                        clear_transient_runtime(rt)
+                        rt["locked_count"] = None
+                        rt["swipe_start_center"] = None
+                        rt["swipe_started_at"] = None
                     else:
-                        direction = detect_swipe(current_center, rt["swipe_start_center"])
-                        if direction is not None:
-                            category = CATEGORY_FROM_DIRECTION[direction]
-                            print(
-                                f"COUNT={rt['locked_count']}, "
-                                f"DIRECTION={direction}, "
-                                f"CATEGORY={category}"
-                            )
+                        if now - rt["swipe_started_at"] > SWIPE_WINDOW_S:
+                            print("Swipe timeout -> back to WAIT_COUNT")
+                            rt["state"] = "WAIT_COUNT"
+                            clear_transient_runtime(rt)
+                        else:
+                            direction = detect_swipe(current_center, rt["swipe_start_center"])
+                            if direction is not None:
+                                category = CATEGORY_FROM_DIRECTION[direction]
+                                print(
+                                    f"COUNT={rt['locked_count']}, "
+                                    f"DIRECTION={direction}, "
+                                    f"CATEGORY={category}"
+                                )
+                                apply_category_decision(rt, rt["locked_count"], category, now)
 
-                            rt["next_idx"] = apply_decision(
-                                rt["assignments"],
-                                rt["history"],
-                                rt["next_idx"],
-                                rt["locked_count"],
-                                category,
-                            )
-
-                            print("ASSIGNMENTS:", assignments_to_string(rt["assignments"]))
-
-                            if all_parts_assigned(rt["assignments"]):
-                                rt["state"] = "WAIT_CONFIRM"
-                                clear_transient_runtime(rt)
-                                set_ui_message(rt, "All 5 assigned. Hold CONFIRM gesture to execute.", 4.0)
-                            else:
-                                rt["state"] = "COOLDOWN"
-                                rt["cooldown_until"] = now + COOLDOWN_S
-                                clear_transient_runtime(rt)
-
-            # ------------------------------------------------
-            # WAIT_CONFIRM / EXECUTING / DONE
-            # ------------------------------------------------
             elif rt["state"] in ("WAIT_CONFIRM", "EXECUTING", "DONE"):
                 pass
 
-            # ------------------------------------------------
-            # DRAW UI
-            # ------------------------------------------------
             if landmarks is not None:
                 draw_hand(frame, landmarks)
 
+            mode_label = "GESTURE" if selected_mode == MODE_GESTURE else "CLASSIC"
+            current_count_display = current_count if selected_mode == MODE_GESTURE else rt["stable_count_value"]
             lines = [
                 f"STATE: {rt['state']}",
+                f"INPUT: {mode_label}",
                 f"MODE: {'SIMULATION' if SIM_MODE else 'REAL ROBOT'}",
                 f"NEXT SLOT: {rt['next_idx'] + 1 if rt['next_idx'] < TOTAL_PARTS else '-'} / {TOTAL_PARTS}",
-                f"CURRENT COUNT: {current_count if current_count is not None else '-'}",
+                f"CURRENT COUNT: {current_count_display if current_count_display is not None else '-'}",
                 f"LOCKED COUNT: {rt['locked_count'] if rt['locked_count'] is not None else '-'}",
                 f"HAND: {display_handedness_label if detected_hand else '-'}",
                 f"ASSIGNMENTS: {assignments_to_string(rt['assignments'])}",
-                "Directions: RIGHT=OK | UP=REDO | LEFT=NOK",
+                "Directions: RIGHT=OK | UP=REDO1 | DOWN=REDO2 | LEFT=NOK",
                 f"Config JSON: {os.path.basename(ROBOT_CONFIG_PATH)} | configured={robot_cfg.get('configured', False)}",
             ]
             key_lines = [
-                "C = confirm",
-                "R = reset batch",
+                "1..5 = part count",
+                "ARROWS = OK / REDO1 / REDO2 / NOK",
+                "ENTER = confirm batch",
+                "R = reset / new batch",
                 "U = undo last step",
                 "L = reload JSON",
                 "P = print robot joints",
                 "ESC = exit",
             ]
+            if selected_mode == MODE_GESTURE:
+                key_lines.insert(0, "Camera gestures are active")
+            else:
+                key_lines.insert(0, "Keyboard only mode")
             put_lines(frame, lines)
             put_lines_right(frame, key_lines)
 
-            if states is not None:
+            if selected_mode == MODE_GESTURE and states is not None:
                 if rt["state"] not in ("COOLDOWN", "EXECUTING", "DONE"):
                     if is_confirm_gesture(states):
                         held = 0.0
@@ -1042,21 +1176,32 @@ def main():
 
             if rt["state"] == "WAIT_COUNT":
                 remaining = TOTAL_PARTS - rt["next_idx"]
-                if rt["stable_count_value"] is not None:
-                    held = now - rt["stable_count_started"] if rt["stable_count_started"] else 0.0
-                    cv2.putText(
-                        frame,
-                        f"Holding {rt['stable_count_value']} / {remaining} ({held:.2f}s)",
-                        (20, frame.shape[0] - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 255, 255),
-                        2,
-                    )
+                if selected_mode == MODE_GESTURE:
+                    if rt["stable_count_value"] is not None:
+                        held = now - rt["stable_count_started"] if rt["stable_count_started"] else 0.0
+                        cv2.putText(
+                            frame,
+                            f"Holding {rt['stable_count_value']} / {remaining} ({held:.2f}s)",
+                            (20, frame.shape[0] - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            (0, 255, 255),
+                            2,
+                        )
+                    else:
+                        cv2.putText(
+                            frame,
+                            f"Show canonical 1..{max(1, remaining)} and hold",
+                            (20, frame.shape[0] - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            (0, 255, 255),
+                            2,
+                        )
                 else:
                     cv2.putText(
                         frame,
-                        f"Show canonical 1..{max(1, remaining)} and hold",
+                        f"Press 1..{max(1, remaining)} to choose how many parts go together",
                         (20, frame.shape[0] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.8,
@@ -1065,28 +1210,41 @@ def main():
                     )
 
             elif rt["state"] == "WAIT_DIRECTION":
-                cv2.putText(
-                    frame,
-                    f"Locked {rt['locked_count']}. Swipe RIGHT / UP / LEFT",
-                    (20, frame.shape[0] - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 200, 255),
-                    2,
-                )
-                if rt["swipe_start_center"] is not None:
-                    h, w = frame.shape[:2]
-                    px = int(rt["swipe_start_center"][0] * w)
-                    py = int(rt["swipe_start_center"][1] * h)
-                    cv2.circle(frame, (px, py), 10, (255, 0, 255), 2)
-
-            elif rt["state"] == "COOLDOWN":
-                pass
+                if selected_mode == MODE_GESTURE:
+                    cv2.putText(
+                        frame,
+                        f"Locked {rt['locked_count']}. Swipe RIGHT / UP / DOWN / LEFT",
+                        (20, frame.shape[0] - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 200, 255),
+                        2,
+                    )
+                    if rt["swipe_start_center"] is not None:
+                        h, w = frame.shape[:2]
+                        px = int(rt["swipe_start_center"][0] * w)
+                        py = int(rt["swipe_start_center"][1] * h)
+                        cv2.circle(frame, (px, py), 10, (255, 0, 255), 2)
+                else:
+                    cv2.putText(
+                        frame,
+                        f"Locked {rt['locked_count']}. Press RIGHT=OK / UP=REDO1 / DOWN=REDO2 / LEFT=NOK",
+                        (20, frame.shape[0] - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 200, 255),
+                        2,
+                    )
 
             elif rt["state"] == "WAIT_CONFIRM":
+                confirm_hint = (
+                    "All 5 parts assigned - hold CONFIRM gesture, press Enter or C"
+                    if selected_mode == MODE_GESTURE
+                    else "All 5 parts assigned - press Enter to execute batch"
+                )
                 cv2.putText(
                     frame,
-                    "All 5 parts assigned - hold CONFIRM gesture or press C",
+                    confirm_hint,
                     (20, frame.shape[0] - 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
@@ -1106,9 +1264,14 @@ def main():
                 )
 
             elif rt["state"] == "DONE":
+                done_hint = (
+                    "BATCH EXECUTED - press R or hold NEW BATCH gesture"
+                    if selected_mode == MODE_GESTURE
+                    else "BATCH EXECUTED - press R to start a new batch"
+                )
                 cv2.putText(
                     frame,
-                    "BATCH EXECUTED - press R or hold NEW BATCH gesture",
+                    done_hint,
                     (20, frame.shape[0] - 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
@@ -1117,15 +1280,16 @@ def main():
                 )
 
             cv2.imshow(window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKeyEx(1)
 
             if key == 27:
                 break
 
             elif key in (ord("r"), ord("R")):
+                was_done = rt["state"] == "DONE"
                 rt = reset_runtime()
-                set_ui_message(rt, "Batch reset.")
-                print("Batch reset.")
+                set_ui_message(rt, "New batch started." if was_done else "Batch reset.")
+                print("New batch started." if was_done else "Batch reset.")
 
             elif key in (ord("u"), ord("U")):
                 if rt["history"] and rt["state"] not in ("EXECUTING", "DONE"):
@@ -1140,21 +1304,10 @@ def main():
                 else:
                     set_ui_message(rt, "Nothing to undo.")
 
-            elif key in (ord("c"), ord("C")):
+            elif key in (ord("c"), ord("C")) or key in KEY_ENTER:
                 if rt["state"] == "WAIT_CONFIRM":
                     try:
-                        plan = build_execution_plan(rt["assignments"], robot_cfg)
-                        rt["state"] = "EXECUTING"
-                        set_ui_message(rt, "Executing batch...")
-
-                        if SIM_MODE:
-                            simulate_robot_execution(plan, robot_cfg)
-                        else:
-                            robot_controller.execute_plan(plan)
-
-                        rt["batch_executed"] = True
-                        rt["state"] = "DONE"
-                        set_ui_message(rt, "Batch executed successfully.", 4.0)
+                        execute_current_batch(rt, robot_cfg, robot_controller)
                     except Exception as e:
                         rt["state"] = "WAIT_CONFIRM"
                         set_ui_message(rt, f"Execution failed: {e}", 4.0)
@@ -1186,10 +1339,44 @@ def main():
                         set_ui_message(rt, f"Read joints failed: {e}", 4.0)
                         print(f"Read joints failed: {e}")
 
+            elif selected_mode == MODE_CLASSIC and rt["state"] == "WAIT_COUNT" and key in KEY_DIGITS:
+                count = KEY_DIGITS[key]
+                remaining = TOTAL_PARTS - rt["next_idx"]
+                if 1 <= count <= remaining:
+                    rt["stable_count_value"] = count
+                    rt["locked_count"] = count
+                    rt["state"] = "WAIT_DIRECTION"
+                    set_ui_message(rt, f"Count locked: {count}. Choose category with arrows.")
+                    print(f"LOCKED COUNT = {rt['locked_count']}")
+                else:
+                    set_ui_message(rt, f"Invalid count. Remaining parts: {remaining}")
+
+            elif selected_mode == MODE_CLASSIC and rt["state"] == "WAIT_DIRECTION":
+                direction = None
+                if key == KEY_ARROW_RIGHT:
+                    direction = "RIGHT"
+                elif key == KEY_ARROW_UP:
+                    direction = "UP"
+                elif key == KEY_ARROW_DOWN:
+                    direction = "DOWN"
+                elif key == KEY_ARROW_LEFT:
+                    direction = "LEFT"
+
+                if direction is not None:
+                    category = CATEGORY_FROM_DIRECTION[direction]
+                    print(
+                        f"COUNT={rt['locked_count']}, "
+                        f"DIRECTION={direction}, "
+                        f"CATEGORY={category}"
+                    )
+                    apply_category_decision(rt, rt["locked_count"], category, time.time())
+
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
-        landmarker.close()
+        if landmarker is not None:
+            landmarker.close()
         robot_controller.maybe_disconnect()
 
 
