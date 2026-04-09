@@ -18,10 +18,10 @@
     "home_before_start": true,
     "home_after_finish": true,
     "open_gripper_before_pick": true,
-    "transfer_joint_velocity": 60,
-    "transfer_joint_acceleration": 60,
-    "process_joint_velocity": 30,
-    "process_joint_acceleration": 30
+    "transfer_joint_velocity": 70,
+    "transfer_joint_acceleration": 70,
+    "process_joint_velocity": 35,
+    "process_joint_acceleration": 35
   },
   "poses": {
     "home": [

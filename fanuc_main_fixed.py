@@ -48,13 +48,13 @@ ROBOT_CONFIG_PATH = os.path.join(BASE_DIR, "robot_positions.json")
 # ============================================================
 # CONFIG
 # ============================================================
-SIM_MODE = True
-CAM_INDEX = 0
+SIM_MODE = False
+CAM_INDEX = 1
 MIRROR_DISPLAY = True
 
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 1060
-CAMERA_REFRESH_MS = 30
+CAMERA_REFRESH_MS = 1
 
 TOTAL_PARTS = 5
 TARGET_CATEGORIES = ("OK", "REDO1", "REDO2", "NOK")
@@ -165,7 +165,7 @@ DEFAULT_ROBOT_CONFIG = {
         "cnt_val": 0,
         "linear": False,
         "sleep_after_move_s": 0.0,
-        "sleep_after_gripper_s": 1.0,
+        "sleep_after_gripper_s": 0.0,
         "home_before_start": True,
         "home_after_finish": True,
         "open_gripper_before_pick": True,
@@ -416,9 +416,14 @@ def get_motion_profile(robot_cfg, profile_name: str):
     raise ValueError(f"Unknown motion profile: {profile_name}")
 
 
-def build_execution_plan(assignments, robot_cfg):
+def build_execution_plan(assignments, robot_cfg, existing_target_counts=None):
     poses = robot_cfg["poses"]
     target_fill_count = {category: 0 for category in TARGET_CATEGORIES}
+
+    if existing_target_counts is not None:
+        for category in TARGET_CATEGORIES:
+            target_fill_count[category] = int(existing_target_counts.get(category, 0))
+
     plan = []
 
     for source_slot, category in enumerate(assignments, start=1):
@@ -427,6 +432,11 @@ def build_execution_plan(assignments, robot_cfg):
 
         target_fill_count[category] += 1
         target_slot = target_fill_count[category]
+
+        if target_slot > TOTAL_PARTS:
+            raise ValueError(
+                f"Target slot overflow for category {category}: requested slot {target_slot}, but only {TOTAL_PARTS} positions exist"
+            )
 
         src = poses["sources"][str(source_slot)]
         trg = poses["targets"][category][str(target_slot)]
@@ -601,7 +611,7 @@ class FanucRobotController:
         program_name = self._get_gripper_toggle_program()
         print(f"CALL PROG {program_name}  # toggle gripper")
         self.robot.call_prog(program_name)
-        time.sleep(1.0)
+        time.sleep(0.2)
         self.gripper_is_open = not self.gripper_is_open
 
     def set_gripper(self, is_open: bool):
@@ -2275,13 +2285,6 @@ class MainWindow(QMainWindow):
             self.show_message(f"Potvrzení zablokováno: přiřazeno {self.rt['next_idx']}/{TOTAL_PARTS}")
             return
 
-        try:
-            plan = build_execution_plan(self.rt["assignments"], self.robot_cfg)
-        except Exception as exc:
-            self.show_message(f"Provedení selhalo: {exc}", 4.0)
-            print(f"Provedení selhalo: {exc}")
-            return
-
         batch_counts = count_assignments_by_category(self.rt["assignments"])
         fits, shortages = check_tray_capacity(self.tray_counts, batch_counts)
 
@@ -2291,12 +2294,25 @@ class MainWindow(QMainWindow):
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self._reset_tray_counts()
                 self.append_log("Operátor vyměnil zásobník. Stav digitálního dvojčete zásobníku byl vynulován.")
+                try:
+                    plan = build_execution_plan(self.rt["assignments"], self.robot_cfg)
+                except Exception as exc:
+                    self.show_message(f"Provedení selhalo: {exc}", 4.0)
+                    print(f"Provedení selhalo: {exc}")
+                    return
                 self._start_execution(plan, batch_counts, "Zásobník vyměněn. Provádí se čekající dávka...")
             else:
                 self.rt = reset_runtime()
                 self.show_message("Dávka resetována. Aktuální zásobník zůstal beze změny.")
                 self.append_log("Operátor zrušil čekající dávku kvůli nedostatečné kapacitě zásobníku.")
                 print("Dávka resetována kvůli překročení kapacity zásobníku.")
+            return
+
+        try:
+            plan = build_execution_plan(self.rt["assignments"], self.robot_cfg, self.tray_counts)
+        except Exception as exc:
+            self.show_message(f"Provedení selhalo: {exc}", 4.0)
+            print(f"Provedení selhalo: {exc}")
             return
 
         self._start_execution(plan, batch_counts)
