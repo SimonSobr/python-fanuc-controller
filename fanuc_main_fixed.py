@@ -1,3 +1,6 @@
+# Python Fanuc Controller - Main Script
+# Author: Šimon Šobr, 2026
+
 import json
 import math
 import os
@@ -49,7 +52,7 @@ ROBOT_CONFIG_PATH = os.path.join(BASE_DIR, "robot_positions.json")
 # CONFIG
 # ============================================================
 SIM_MODE = False
-CAM_INDEX = 1
+CAM_INDEX = 2
 MIRROR_DISPLAY = True
 
 WINDOW_WIDTH = 1600
@@ -81,8 +84,8 @@ CATEGORY_UI_LABELS = {
     "NOK": "NOK",
 }
 
-COUNT_HOLD_S = 0.7
-SWIPE_WINDOW_S = 1.5
+COUNT_HOLD_S = 0.5
+SWIPE_WINDOW_S = 2.5
 COOLDOWN_S = 1.0
 CONFIRM_HOLD_S = 1.0
 UNDO_HOLD_S = 1.0
@@ -108,8 +111,8 @@ CATEGORY_FROM_DIRECTION = {
 MODE_CLASSIC = "CLASSIC"
 MODE_GESTURE = "GESTURE"
 
-APP_TITLE = "FANUC kolaborativní robot - ovládání v Pythonu"
-APP_SUBTITLE = "Třídění dávky kolaborativním robotem pomocí gest a klávesnice"
+APP_TITLE = "FANUC robot - Python"
+APP_SUBTITLE = "Třídění dávky kolaborativním robotem"
 
 STATE_UI_LABELS = {
     "WAIT_COUNT": "Čeká na počet",
@@ -121,7 +124,7 @@ STATE_UI_LABELS = {
 }
 
 MODE_UI_LABELS = {
-    "CLASSIC": "Klasický",
+    "CLASSIC": "Klávesnice",
     "GESTURE": "Gesta",
 }
 
@@ -295,14 +298,14 @@ def create_landmarker(model_path: str):
     if not os.path.exists(abs_model_path):
         raise FileNotFoundError(
             f"Missing model file: {abs_model_path}\n"
-            "Download a compatible MediaPipe Hand Landmarker .task model\n"
-            "and save it next to this script."
+            "Je nutné stáhnout kompatibilní MediaPipe Hand Landmarker .task model\n"
+            "a uložit ho vedle tohoto skriptu."
         )
 
     size = os.path.getsize(abs_model_path)
     if size < 1_000_000:
         raise RuntimeError(
-            f"Model file looks invalid or too small: {abs_model_path} ({size} bytes)"
+            f"Soubor modelu je poškozen nebo příliš malý: {abs_model_path} ({size} bytes)"
         )
 
     base_options = python.BaseOptions(model_asset_path=abs_model_path)
@@ -327,8 +330,8 @@ def create_default_robot_config_if_missing(config_path: str) -> None:
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(DEFAULT_ROBOT_CONFIG, f, indent=2)
 
-    print(f"Created default robot config: {config_path}")
-    print("Fill in the joint coordinates and set 'configured' to true for real execution.")
+    print(f"Vytvořen výchozí konfigurační soubor pro robota: {config_path}")
+    print("Vyplňte souřadnice kloubů a nastavte 'configured' na true pro reálné spuštění.")
 
 
 def load_robot_config(config_path: str):
@@ -352,7 +355,7 @@ def validate_joint_list(vals, label: str):
 
 def validate_robot_config_structure(cfg) -> None:
     if "robot_connection" not in cfg or "motion" not in cfg or "poses" not in cfg:
-        raise ValueError("robot config must contain: robot_connection, motion, poses")
+        raise ValueError("Konfigurační soubor musí obsahovat: robot_connection, motion, poses")
 
     motion = cfg["motion"]
     required_motion_keys = [
@@ -370,29 +373,29 @@ def validate_robot_config_structure(cfg) -> None:
     ]
     for key in required_motion_keys:
         if key not in motion:
-            raise ValueError(f"motion must contain: {key}")
+            raise ValueError(f"Pohyb musí obsahovat: {key}")
 
     poses = cfg["poses"]
     if "home" not in poses or "sources" not in poses or "targets" not in poses:
-        raise ValueError("poses must contain: home, sources, targets")
+        raise ValueError("Pozice musí obsahovat: home, sources, targets")
 
     validate_joint_list(poses["home"], "poses.home")
 
     for i in range(1, TOTAL_PARTS + 1):
         src = poses["sources"].get(str(i))
         if src is None:
-            raise ValueError(f"Missing source slot {i} in robot config")
+            raise ValueError(f"Chybí zdrojový slot {i} v robot configu")
         validate_joint_list(src.get("approach"), f"poses.sources.{i}.approach")
         validate_joint_list(src.get("pick"), f"poses.sources.{i}.pick")
 
     for category in TARGET_CATEGORIES:
         cat = poses["targets"].get(category)
         if cat is None:
-            raise ValueError(f"Missing target category {category} in robot config")
+            raise ValueError(f"Chybí cílová kategorie {category} v robot configu")
         for i in range(1, TOTAL_PARTS + 1):
             trg = cat.get(str(i))
             if trg is None:
-                raise ValueError(f"Missing target slot {category}.{i} in robot config")
+                raise ValueError(f"Chybí cílový slot {category}.{i} v robot configu")
             validate_joint_list(trg.get("approach"), f"poses.targets.{category}.{i}.approach")
             validate_joint_list(trg.get("place"), f"poses.targets.{category}.{i}.place")
 
@@ -413,7 +416,7 @@ def get_motion_profile(robot_cfg, profile_name: str):
             "velocity": motion["process_joint_velocity"],
             "acceleration": motion["process_joint_acceleration"],
         }
-    raise ValueError(f"Unknown motion profile: {profile_name}")
+    raise ValueError(f"Neznámý profil pohybu: {profile_name}")
 
 
 def build_execution_plan(assignments, robot_cfg, existing_target_counts=None):
@@ -435,7 +438,7 @@ def build_execution_plan(assignments, robot_cfg, existing_target_counts=None):
 
         if target_slot > TOTAL_PARTS:
             raise ValueError(
-                f"Target slot overflow for category {category}: requested slot {target_slot}, but only {TOTAL_PARTS} positions exist"
+                f"Chybí cílový slot pro kategorii {category}: požadovaný slot {target_slot}, ale existuje pouze {TOTAL_PARTS} pozic"
             )
 
         src = poses["sources"][str(source_slot)]
@@ -1283,8 +1286,8 @@ class TrayCapacityDialog(QDialog):
         root.addWidget(details_card)
 
         note = QLabel(
-            "Zrušit = vyresetuje aktuální dávku a ponechá stav zásobníku. "
-            "Zásobník byl vyměněn = vynuluje digitální dvojče zásobníku a provede potvrzenou dávku."
+            "Zrušit = vyresetuje aktuální dávku a ponechá stav zásobníku."
+            "Zásobník byl vyměněn = vynuluje digitální zásobník a provede potvrzenou dávku."
         )
         note.setObjectName("MutedLabel")
         note.setWordWrap(True)
@@ -1411,7 +1414,7 @@ class ModeSelectionDialog(QDialog):
         buttons.setSpacing(18)
 
         self.classic_btn = ClickableModeCard(
-            "Klasický režim",
+            "Klávesnicový režim",
             "Pouze klávesnice, bez kamery",
             "#38bdf8",
         )
@@ -1654,7 +1657,7 @@ class MainWindow(QMainWindow):
         hint_card.body.addWidget(self.hint_label)
         layout.addWidget(hint_card)
 
-        tray_card = CardFrame("Digitální dvojče zásobníku", accent="#38bdf8")
+        tray_card = CardFrame("Digitální zásobník", accent="#38bdf8")
         tray_note = QLabel("Aktuální obsazení zásobníku. Kapacita každé barvy je 5 pozic.")
         tray_note.setObjectName("MutedLabel")
         tray_note.setWordWrap(True)
@@ -1790,7 +1793,7 @@ class MainWindow(QMainWindow):
             self.landmarker = create_landmarker(MODEL_PATH)
             print("Hand Landmarker byl načten.")
         else:
-            print("Zvolen klasický režim: pouze klávesnice, kamera vypnuta.")
+            print("Zvolen klávesnicový režim: pouze klávesnice, kamera vypnuta.")
 
     def _release_mode_resources(self):
         if self.cap is not None:
@@ -1830,7 +1833,7 @@ class MainWindow(QMainWindow):
             if new_mode == MODE_CLASSIC:
                 self._release_mode_resources()
                 self.selected_mode = MODE_CLASSIC
-                print("Zvolen klasický režim: pouze klávesnice, kamera vypnuta.")
+                print("Zvolen klávesnicový režim: pouze klávesnice, kamera vypnuta.")
             else:
                 self.selected_mode = MODE_GESTURE
                 self._setup_mode_resources()
@@ -1893,7 +1896,6 @@ class MainWindow(QMainWindow):
             row.set_count(self.tray_counts.get(category, 0))
 
         legend_lines = [
-            "<b>Veškerá funkcionalita zůstala zachována.</b>",
             "<br><b>Klávesnice:</b><br>"
             "1..5 = počet dílů<br>"
             "Kategorie 1 = OK<br>"
@@ -1905,7 +1907,7 @@ class MainWindow(QMainWindow):
             "R = reset aktuální dávky / nová dávka<br>"
             "L = načíst JSON znovu<br>"
             "P = vypsat aktuální kloubové souřadnice robota<br>"
-            "Ctrl+K = přepnout na klasický režim<br>"
+            "Ctrl+K = přepnout na klávesnicový režim<br>"
             "Ctrl+G = přepnout na režim gest<br>"
             "Esc = konec",
         ]
@@ -1916,13 +1918,13 @@ class MainWindow(QMainWindow):
         if self.selected_mode == MODE_GESTURE:
             legend_lines.append(
                 "<br><br><b>Režim gest:</b><br>"
-                "Podrž kanonické gesto 1..5 pro uzamčení počtu a poté pohybem zvol kategorii.<br>"
+                "Podrž gesto 1..5 pro uzamčení počtu a poté pohybem zvol kategorii.<br>"
                 "Gesto potvrzení = (False, False, True, True, True)<br>"
                 "Gesto zpět = (True, True, False, False, False)<br>"
                 "Gesto nové dávky = (True, False, False, False, True)"
             )
         else:
-            legend_lines.append("<br><br><b>Klasický režim:</b><br>Kamera je vypnutá. Celý tok běží pouze přes klávesnici.")
+            legend_lines.append("<br><br><b>Klávesnicový režim:</b><br>Kamera je vypnutá. Celý tok běží pouze přes klávesnici.")
         legend_lines.append(f"<br><br><b>Aktivní JSON:</b><br>{ROBOT_CONFIG_PATH}")
         self.legend_label.setText("".join(legend_lines))
         self._apply_state_glow()
@@ -1930,7 +1932,7 @@ class MainWindow(QMainWindow):
         if self.rt["state"] == "WAIT_COUNT":
             remaining = TOTAL_PARTS - self.rt["next_idx"]
             if self.selected_mode == MODE_GESTURE:
-                hint = f"Ukaž kanonické gesto 1..{max(1, remaining)} a drž ruku v klidu."
+                hint = f"Ukaž gesto 1..{max(1, remaining)} a drž ruku v klidu."
             else:
                 hint = f"Stiskni 1..{max(1, remaining)} pro volbu počtu dílů ve skupině."
         elif self.rt["state"] == "WAIT_DIRECTION":
@@ -2293,7 +2295,7 @@ class MainWindow(QMainWindow):
             dialog = TrayCapacityDialog(shortages, self.tray_counts, batch_counts, self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self._reset_tray_counts()
-                self.append_log("Operátor vyměnil zásobník. Stav digitálního dvojčete zásobníku byl vynulován.")
+                self.append_log("Operátor vyměnil zásobník. Stav digitálního zásobníku byl vynulován.")
                 try:
                     plan = build_execution_plan(self.rt["assignments"], self.robot_cfg)
                 except Exception as exc:
